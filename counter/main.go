@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"maps"
 )
 
 var (
@@ -30,9 +31,7 @@ func numOfVisits(w http.ResponseWriter, req *http.Request) {
 
 	// Make a copy of the current counter to persist safely
 	currentState := make(map[string]int)
-	for k, v := range Counter {
-		currentState[k] = v
-	}
+	maps.Copy(currentState, Counter)
 	mu.Unlock()
 
 	// Persist the updated counter
