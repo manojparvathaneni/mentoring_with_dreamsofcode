@@ -6,82 +6,85 @@ import (
 	"net/http"
 	"os"
 	"sync"
-	"maps"
+	"sync/atomic"
 )
 
+type VisitCounter struct {
+	Visits atomic.Int64
+}
+
+type counterData struct {
+	Visits int64 `json:"visits"`
+}
+
 var (
-	Counter  map[string]int
 	mu       sync.Mutex
 	filename = "counter.json"
+	counter  *VisitCounter
 )
 
 func init() {
-	Counter = readCounter(filename)
-
-	// Initialize if key not present
-	if _, ok := Counter["visited"]; !ok {
-		Counter["visited"] = 0
+	var err error
+	counter, err = loadCounter()
+	if err != nil {
+		log.Println("Error loading counter:", err)
+		counter = &VisitCounter{} // fallback to zero
 	}
 }
 
-func numOfVisits(w http.ResponseWriter, req *http.Request) {
+func saveCounter(counter *VisitCounter) error {
 	mu.Lock()
-	Counter["visited"]++
-	visitedCount := Counter["visited"]
+	defer mu.Unlock()
 
-	// Make a copy of the current counter to persist safely
-	currentState := make(map[string]int)
-	maps.Copy(currentState, Counter)
-	mu.Unlock()
+	data := counterData{Visits: counter.Visits.Load()}
 
-	// Persist the updated counter
-	persistCounter(currentState)
+	jsonBytes, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filename, jsonBytes, 0644)
+}
 
-	// Send JSON response
+func loadCounter() (*VisitCounter, error) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	counter := &VisitCounter{}
+
+	bytes, err := os.ReadFile(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return counter, nil
+		}
+		return nil, err
+	}
+
+	var data counterData
+	if err := json.Unmarshal(bytes, &data); err != nil {
+		return nil, err
+	}
+
+	counter.Visits.Store(data.Visits)
+	return counter, nil
+}
+
+func updateCounter(w http.ResponseWriter, req *http.Request) {
+	counter.Visits.Add(1)
+
+	if err := saveCounter(counter); err != nil {
+		log.Println("Error saving counter:", err)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(map[string]int{"visited": visitedCount}); err != nil {
+
+	if err := json.NewEncoder(w).Encode(counterData{Visits: counter.Visits.Load()}); err != nil {
 		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 	}
 }
 
-func persistCounter(counter map[string]int) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	jsonData, err := json.MarshalIndent(counter, "", "  ")
-	if err != nil {
-		log.Println("Error marshalling JSON:", err)
-		return
-	}
-
-	if err := os.WriteFile(filename, jsonData, 0644); err != nil {
-		log.Println("Error writing JSON to file:", err)
-	}
-}
-
-func readCounter(filename string) map[string]int {
-	readData, err := os.ReadFile(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			log.Println("Counter file not found. Starting fresh.")
-			return make(map[string]int)
-		}
-		log.Println("Error reading counter file:", err)
-		return make(map[string]int)
-	}
-
-	var readMap map[string]int
-	if err := json.Unmarshal(readData, &readMap); err != nil {
-		log.Println("Error unmarshalling JSON:", err)
-		return make(map[string]int)
-	}
-
-	return readMap
-}
-
 func main() {
-	http.HandleFunc("/api/counter", numOfVisits)
+	http.HandleFunc("/api/counter", updateCounter)
 
 	log.Println("Starting Counter Server....")
 	log.Println("Listening on port 8090")
