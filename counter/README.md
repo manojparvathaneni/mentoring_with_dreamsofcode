@@ -25,23 +25,8 @@ Create a Go-based HTTP API that:
 - [🔹 Step 6: Use `atomic.Int64` in a Struct and Return JSON](#-step-6-use-atomicint64-in-a-struct-and-return-json)
 - [🔹 Step 8: File Locking with `syscall.Flock`](#-step-8-file-locking-with-syscallflock)
 - [🏁 Final Implementation: Full API](#-final-implementation-full-api)
-- [🧠 Summary of Concepts Learned](#-summary-of-concepts-learned)
+- [🧠 Summary of Concepts Learned](#-summary-of-concepts-learned
 
----
-
-
-# Building a Resilient Counter API in Go
-
-This guide walks you through the **evolution** of a counter API in Go. We begin with a basic goal and incrementally build toward a robust, concurrent, persistent API. Each stage includes a runnable contrived example focused on one concept, followed by an enhancement that moves us closer to the final project.
-
-## 🎯 End Goal
-Create a Go-based HTTP API that:
-- Returns a visit count in JSON
-- Is concurrency-safe
-- Persists data to disk
-- Works reliably across multiple instances (file locking)
-
----
 
 ## 🪜 Step-by-Step Evolution
 
