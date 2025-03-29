@@ -346,4 +346,3 @@ func main() {
 - Struct marshaling and unmarshaling
 - File locking with `syscall.Flock`
 
-Each stage is an isolated, testable example that can be run independently and built upon. The end result is a well-structured, concurrent, persistent counter service you can run with multiple instances for resilience.
