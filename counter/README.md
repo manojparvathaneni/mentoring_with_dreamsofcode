@@ -29,7 +29,7 @@ Create a Go-based HTTP API that:
 
 ---
 
-[Content continues from canvas...]
+
 # Building a Resilient Counter API in Go
 
 This guide walks you through the **evolution** of a counter API in Go. We begin with a basic goal and incrementally build toward a robust, concurrent, persistent API. Each stage includes a runnable contrived example focused on one concept, followed by an enhancement that moves us closer to the final project.
