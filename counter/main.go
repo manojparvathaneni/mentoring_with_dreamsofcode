@@ -5,8 +5,8 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"sync"
 	"sync/atomic"
+	"syscall"
 )
 
 type VisitCounter struct {
@@ -18,7 +18,6 @@ type counterData struct {
 }
 
 var (
-	mu       sync.Mutex
 	filename = "counter.json"
 	counter  *VisitCounter
 )
@@ -33,35 +32,48 @@ func init() {
 }
 
 func saveCounter(counter *VisitCounter) error {
-	mu.Lock()
-	defer mu.Unlock()
-
 	data := counterData{Visits: counter.Visits.Load()}
 
 	jsonBytes, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filename, jsonBytes, 0644)
+
+	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Apply exclusive lock for writing
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+
+	_, err = f.Write(jsonBytes)
+	return err
 }
 
 func loadCounter() (*VisitCounter, error) {
-	mu.Lock()
-	defer mu.Unlock()
-
 	counter := &VisitCounter{}
 
-	bytes, err := os.ReadFile(filename)
+	f, err := os.OpenFile(filename, os.O_RDONLY|os.O_CREATE, 0644)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return counter, nil
-		}
 		return nil, err
 	}
+	defer f.Close()
+
+	// Apply shared lock for reading
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+		return nil, err
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 
 	var data counterData
-	if err := json.Unmarshal(bytes, &data); err != nil {
-		return nil, err
+	if err := json.NewDecoder(f).Decode(&data); err != nil {
+		// If file is empty, return zero counter
+		return counter, nil
 	}
 
 	counter.Visits.Store(data.Visits)
