@@ -1,0 +1,725 @@
+// Package counter provides a visit tracking service with robust persistence
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rs/cors"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"github.com/spf13/viper"
+	"golang.org/x/time/rate"
+)
+
+// Constants for default configuration
+const (
+	defaultPort              = "8090"
+	defaultFilename          = "counter.json"
+	defaultShutdownTimeout   = 10 * time.Second
+	defaultFilePermissions   = 0644
+	defaultSaveRetryAttempts = 3
+	defaultSaveRetryDelay    = 100 * time.Millisecond
+	defaultRateLimit         = 10
+	defaultRateBurst         = 20
+	defaultPersistInterval   = 5 * time.Minute
+	version                  = "1.0.0"
+)
+
+// Config holds application configuration
+type Config struct {
+	Port              string
+	Filename          string
+	ShutdownTimeout   time.Duration
+	FilePermissions   os.FileMode
+	SaveRetryAttempts int
+	SaveRetryDelay    time.Duration
+	RateLimit         int
+	RateBurst         int
+	PersistInterval   time.Duration
+	LogLevel          string
+	EnableMetrics     bool
+	EnableCORS        bool
+	AllowedOrigins    []string
+	Environment       string
+}
+
+// VisitCounter stores the visit count using atomic operations for thread safety
+type VisitCounter struct {
+	Visits    atomic.Int64
+	lastSaved atomic.Int64
+	dirty     atomic.Bool
+}
+
+// counterData is used for JSON serialization
+type counterData struct {
+	Visits    int64     `json:"visits"`
+	Timestamp time.Time `json:"last_updated"`
+	Version   string    `json:"version"`
+	CRC       uint32    `json:"crc,omitempty"`
+}
+
+// HTTPResponse standardizes API responses
+type HTTPResponse struct {
+	Success      bool        `json:"success"`
+	Data         interface{} `json:"data,omitempty"`
+	Error        string      `json:"error,omitempty"`
+	ErrorCode    string      `json:"error_code,omitempty"`
+	RequestID    string      `json:"request_id,omitempty"`
+	ResponseTime float64     `json:"response_time_ms,omitempty"`
+}
+
+// Server encapsulates the HTTP server and its dependencies
+type Server struct {
+	config  Config
+	counter *VisitCounter
+	limiter *rate.Limiter
+	srv     *http.Server
+}
+
+// Metrics for Prometheus
+var (
+	counterRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "counter_requests_total",
+		Help: "The total number of requests",
+	}, []string{"method", "endpoint", "status"})
+
+	counterOperations = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "counter_operations_total",
+		Help: "The total number of counter operations",
+	}, []string{"operation"})
+
+	counterValue = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "counter_current_value",
+		Help: "The current value of the counter",
+	})
+
+	operationDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "counter_operation_duration_seconds",
+		Help:    "Duration of counter operations",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"operation"})
+
+	persistErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "counter_persist_errors_total",
+		Help: "Total number of errors when persisting counter",
+	})
+)
+
+// Load the application configuration
+func loadConfig() Config {
+	// Set up default configuration
+	viper.SetDefault("port", defaultPort)
+	viper.SetDefault("filename", defaultFilename)
+	viper.SetDefault("shutdownTimeout", defaultShutdownTimeout)
+	viper.SetDefault("filePermissions", defaultFilePermissions)
+	viper.SetDefault("saveRetryAttempts", defaultSaveRetryAttempts)
+	viper.SetDefault("saveRetryDelay", defaultSaveRetryDelay)
+	viper.SetDefault("rateLimit", defaultRateLimit)
+	viper.SetDefault("rateBurst", defaultRateBurst)
+	viper.SetDefault("persistInterval", defaultPersistInterval)
+	viper.SetDefault("logLevel", "info")
+	viper.SetDefault("enableMetrics", true)
+	viper.SetDefault("enableCORS", true)
+	viper.SetDefault("allowedOrigins", []string{"*"})
+	viper.SetDefault("environment", "development")
+
+	// Set up configuration file
+	viper.SetConfigName("config")
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath(".")
+	viper.AddConfigPath("/etc/counter/")
+
+	// Environment variables override
+	viper.AutomaticEnv()
+	viper.SetEnvPrefix("COUNTER")
+
+	// Read configuration
+	if err := viper.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			log.Warn().Err(err).Msg("Error reading config file")
+		}
+	}
+
+	// Load configuration into struct
+	config := Config{
+		Port:              viper.GetString("port"),
+		Filename:          viper.GetString("filename"),
+		ShutdownTimeout:   viper.GetDuration("shutdownTimeout"),
+		FilePermissions:   os.FileMode(viper.GetInt("filePermissions")),
+		SaveRetryAttempts: viper.GetInt("saveRetryAttempts"),
+		SaveRetryDelay:    viper.GetDuration("saveRetryDelay"),
+		RateLimit:         viper.GetInt("rateLimit"),
+		RateBurst:         viper.GetInt("rateBurst"),
+		PersistInterval:   viper.GetDuration("persistInterval"),
+		LogLevel:          viper.GetString("logLevel"),
+		EnableMetrics:     viper.GetBool("enableMetrics"),
+		EnableCORS:        viper.GetBool("enableCORS"),
+		AllowedOrigins:    viper.GetStringSlice("allowedOrigins"),
+		Environment:       viper.GetString("environment"),
+	}
+
+	return config
+}
+
+// setupLogging configures the logger
+func setupLogging(config Config) {
+	// Set up pretty console logging for development
+	if config.Environment == "development" {
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339})
+	}
+
+	// Set log level
+	level, err := zerolog.ParseLevel(config.LogLevel)
+	if err != nil {
+		level = zerolog.InfoLevel
+	}
+	zerolog.SetGlobalLevel(level)
+
+	// Add caller info to log
+	zerolog.CallerMarshalFunc = func(pc uintptr, file string, line int) string {
+		short := file
+		for i := len(file) - 1; i > 0; i-- {
+			if file[i] == '/' {
+				short = file[i+1:]
+				break
+			}
+		}
+		return fmt.Sprintf("%s:%d", short, line)
+	}
+	log.Logger = log.With().Caller().Logger()
+
+	// Log basic information
+	log.Info().
+		Str("version", version).
+		Str("environment", config.Environment).
+		Str("port", config.Port).
+		Str("filename", config.Filename).
+		Msg("Counter server initializing")
+}
+
+// NewServer creates a new server instance
+func NewServer(config Config) (*Server, error) {
+	// Create rate limiter
+	limiter := rate.NewLimiter(rate.Limit(config.RateLimit), config.RateBurst)
+
+	// Load counter
+	counter, err := loadCounter(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load counter: %w", err)
+	}
+
+	// Set metric for current counter value
+	counterValue.Set(float64(counter.Visits.Load()))
+
+	// Create server
+	server := &Server{
+		config:  config,
+		counter: counter,
+		limiter: limiter,
+	}
+
+	// Start background persistence
+	go server.backgroundPersistence()
+
+	return server, nil
+}
+
+// calculateCRC calculates a checksum for data validation
+func calculateCRC(data []byte) uint32 {
+	var crc uint32 = 0
+	for _, b := range data {
+		crc = crc*31 + uint32(b)
+	}
+	return crc
+}
+
+// saveCounter persists the counter to disk with file locking
+func saveCounter(counter *VisitCounter, config Config) error {
+	timer := prometheus.NewTimer(operationDuration.WithLabelValues("save"))
+	defer timer.ObserveDuration()
+
+	counterOperations.WithLabelValues("save").Inc()
+
+	data := counterData{
+		Visits:    counter.Visits.Load(),
+		Timestamp: time.Now(),
+		Version:   version,
+	}
+
+	jsonBytes, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal counter data: %w", err)
+	}
+
+	// Calculate CRC and add it to the data
+	crc := calculateCRC(jsonBytes)
+	data.CRC = crc
+
+	// Re-marshal with CRC
+	jsonBytes, err = json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal counter data with CRC: %w", err)
+	}
+
+	// Implement retry logic for file operations
+	var saveErr error
+	for attempt := 0; attempt < config.SaveRetryAttempts; attempt++ {
+		saveErr = writeToDisk(jsonBytes, config)
+		if saveErr == nil {
+			// Update last saved value and clear dirty flag
+			counter.lastSaved.Store(counter.Visits.Load())
+			counter.dirty.Store(false)
+			return nil
+		}
+
+		log.Warn().
+			Err(saveErr).
+			Int("attempt", attempt+1).
+			Int("maxAttempts", config.SaveRetryAttempts).
+			Msg("Save attempt failed, retrying")
+
+		persistErrors.Inc()
+		time.Sleep(config.SaveRetryDelay)
+	}
+
+	return fmt.Errorf("failed to save counter after %d attempts: %w", config.SaveRetryAttempts, saveErr)
+}
+
+// writeToDisk handles the actual file writing with proper locking
+func writeToDisk(data []byte, config Config) error {
+	timer := prometheus.NewTimer(operationDuration.WithLabelValues("write"))
+	defer timer.ObserveDuration()
+
+	counterOperations.WithLabelValues("write").Inc()
+
+	// Create temp file for atomic writing
+	tempFile := config.Filename + ".tmp"
+	f, err := os.OpenFile(tempFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, config.FilePermissions)
+	if err != nil {
+		return fmt.Errorf("failed to open temp file: %w", err)
+	}
+
+	defer func() {
+		f.Close()
+		// Clean up temp file on error
+		if err != nil {
+			os.Remove(tempFile)
+		}
+	}()
+
+	// Apply exclusive lock for writing
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("failed to acquire write lock: %w", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+
+	if _, err = f.Write(data); err != nil {
+		return fmt.Errorf("failed to write data: %w", err)
+	}
+
+	// Ensure data is written to disk
+	if err = f.Sync(); err != nil {
+		return fmt.Errorf("failed to sync file: %w", err)
+	}
+
+	// Close file explicitly before rename
+	f.Close()
+
+	// Atomically replace the old file with the new one
+	if err := os.Rename(tempFile, config.Filename); err != nil {
+		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+
+	return nil
+}
+
+// loadCounter reads the counter from disk with file locking
+func loadCounter(config Config) (*VisitCounter, error) {
+	timer := prometheus.NewTimer(operationDuration.WithLabelValues("load"))
+	defer timer.ObserveDuration()
+
+	counterOperations.WithLabelValues("load").Inc()
+
+	counter := &VisitCounter{}
+
+	// Check if file exists
+	if _, err := os.Stat(config.Filename); os.IsNotExist(err) {
+		log.Info().Msg("Counter file does not exist, starting with zero")
+		return counter, nil
+	}
+
+	f, err := os.OpenFile(config.Filename, os.O_RDONLY, config.FilePermissions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open counter file: %w", err)
+	}
+	defer f.Close()
+
+	// Apply shared lock for reading
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+		return nil, fmt.Errorf("failed to acquire read lock: %w", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+
+	// Check if file is empty
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	if fi.Size() == 0 {
+		log.Info().Msg("Empty counter file, starting with zero")
+		return counter, nil
+	}
+
+	// Read file content
+	content, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read counter file: %w", err)
+	}
+
+	var data counterData
+	if err := json.Unmarshal(content, &data); err != nil {
+		log.Warn().Err(err).Msg("Failed to decode counter data, starting with zero")
+		return counter, nil
+	}
+
+	// Validate CRC if present
+	if data.CRC > 0 {
+		// Create a copy without CRC for validation
+		dataCopy := data
+		dataCopy.CRC = 0
+		jsonBytes, err := json.MarshalIndent(dataCopy, "", "  ")
+		if err == nil {
+			calculatedCRC := calculateCRC(jsonBytes)
+			if calculatedCRC != data.CRC {
+				log.Warn().
+					Uint32("expected", data.CRC).
+					Uint32("calculated", calculatedCRC).
+					Msg("CRC validation failed, starting with zero")
+				return counter, nil
+			}
+		}
+	}
+
+	counter.Visits.Store(data.Visits)
+	counter.lastSaved.Store(data.Visits)
+	log.Info().Int64("visits", data.Visits).Msg("Counter loaded successfully")
+
+	return counter, nil
+}
+
+// backgroundPersistence periodically saves the counter to disk
+func (s *Server) backgroundPersistence() {
+	ticker := time.NewTicker(s.config.PersistInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if s.counter.dirty.Load() {
+				log.Debug().Msg("Performing scheduled counter persistence")
+				if err := saveCounter(s.counter, s.config); err != nil {
+					log.Error().Err(err).Msg("Failed to persist counter in background")
+				}
+			}
+		}
+	}
+}
+
+// requestLogMiddleware logs HTTP requests
+func (s *Server) requestLogMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Generate request ID
+		requestID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), atomic.AddInt64(new(int64), 1))
+
+		// Add request ID to context
+		ctx := context.WithValue(r.Context(), "requestID", requestID)
+		r = r.WithContext(ctx)
+
+		// Wrap response writer to capture status code
+		rw := newResponseWriter(w)
+
+		// Process request
+		next.ServeHTTP(rw, r)
+
+		// Calculate duration
+		duration := time.Since(start)
+
+		// Log request
+		log.Info().
+			Str("method", r.Method).
+			Str("path", r.URL.Path).
+			Str("remote", r.RemoteAddr).
+			Int("status", rw.status).
+			Dur("duration", duration).
+			Str("requestID", requestID).
+			Msg("Request processed")
+
+		// Update metrics
+		counterRequests.WithLabelValues(r.Method, r.URL.Path, fmt.Sprintf("%d", rw.status)).Inc()
+	})
+}
+
+// rateLimitMiddleware implements rate limiting
+func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.limiter.Allow() {
+			s.sendJSONResponse(w, http.StatusTooManyRequests, HTTPResponse{
+				Success:   false,
+				Error:     "Rate limit exceeded",
+				ErrorCode: "RATE_LIMIT_EXCEEDED",
+				RequestID: r.Context().Value("requestID").(string),
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// responseWriter wraps http.ResponseWriter to capture status code
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+// newResponseWriter creates a new responseWriter
+func newResponseWriter(w http.ResponseWriter) *responseWriter {
+	return &responseWriter{w, http.StatusOK}
+}
+
+// WriteHeader captures the status code
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// incrementCounter handles the /api/counter/increment endpoint
+func (s *Server) incrementCounter(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
+	// Check for proper HTTP method
+	if r.Method != http.MethodPost {
+		s.sendJSONResponse(w, http.StatusMethodNotAllowed, HTTPResponse{
+			Success:      false,
+			Error:        "Method not allowed",
+			ErrorCode:    "METHOD_NOT_ALLOWED",
+			RequestID:    r.Context().Value("requestID").(string),
+			ResponseTime: float64(time.Since(start).Microseconds()) / 1000.0,
+		})
+		return
+	}
+
+	// Increment the counter
+	newCount := s.counter.Visits.Add(1)
+	s.counter.dirty.Store(true)
+
+	// Update prometheus metric
+	counterValue.Set(float64(newCount))
+	counterOperations.WithLabelValues("increment").Inc()
+
+	// Send response
+	s.sendJSONResponse(w, http.StatusOK, HTTPResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"visits": newCount,
+		},
+		RequestID:    r.Context().Value("requestID").(string),
+		ResponseTime: float64(time.Since(start).Microseconds()) / 1000.0,
+	})
+}
+
+// getCounter handles retrieving the current count without incrementing
+func (s *Server) getCounter(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
+	if r.Method != http.MethodGet {
+		s.sendJSONResponse(w, http.StatusMethodNotAllowed, HTTPResponse{
+			Success:      false,
+			Error:        "Method not allowed",
+			ErrorCode:    "METHOD_NOT_ALLOWED",
+			RequestID:    r.Context().Value("requestID").(string),
+			ResponseTime: float64(time.Since(start).Microseconds()) / 1000.0,
+		})
+		return
+	}
+
+	counterOperations.WithLabelValues("get").Inc()
+
+	// Read counter
+	currentCount := s.counter.Visits.Load()
+
+	s.sendJSONResponse(w, http.StatusOK, HTTPResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"visits": currentCount,
+		},
+		RequestID:    r.Context().Value("requestID").(string),
+		ResponseTime: float64(time.Since(start).Microseconds()) / 1000.0,
+	})
+}
+
+// healthCheck handles the health check endpoint
+func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Basic health check
+	health := map[string]interface{}{
+		"status":    "UP",
+		"timestamp": time.Now().Format(time.RFC3339),
+		"version":   version,
+		"buildInfo": map[string]string{
+			"goVersion": runtime.Version(),
+			"platform":  runtime.GOOS + "/" + runtime.GOARCH,
+		},
+	}
+
+	s.sendJSONResponse(w, http.StatusOK, HTTPResponse{
+		Success:      true,
+		Data:         health,
+		RequestID:    r.Context().Value("requestID").(string),
+		ResponseTime: float64(time.Since(start).Microseconds()) / 1000.0,
+	})
+}
+
+// sendJSONResponse standardizes the API response format
+func (s *Server) sendJSONResponse(w http.ResponseWriter, statusCode int, response HTTPResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Error().Err(err).Msg("Failed to encode response")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+}
+
+// setupRoutes configures the HTTP routes with middleware
+func (s *Server) setupRoutes() http.Handler {
+	mux := http.NewServeMux()
+
+	// API endpoints
+	mux.HandleFunc("/api/counter/increment", s.incrementCounter)
+	mux.HandleFunc("/api/counter", s.getCounter)
+
+	// Health and metrics
+	mux.HandleFunc("/health", s.healthCheck)
+	if s.config.EnableMetrics {
+		mux.Handle("/metrics", promhttp.Handler())
+	}
+
+	// Apply middleware stack
+	var handler http.Handler = mux
+
+	// Rate limiting
+	handler = s.rateLimitMiddleware(handler)
+
+	// Request logging
+	handler = s.requestLogMiddleware(handler)
+
+	// CORS if enabled
+	if s.config.EnableCORS {
+		corsMiddleware := cors.New(cors.Options{
+			AllowedOrigins:   s.config.AllowedOrigins,
+			AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+			AllowedHeaders:   []string{"Content-Type", "Authorization"},
+			AllowCredentials: true,
+			MaxAge:           300,
+		})
+		handler = corsMiddleware.Handler(handler)
+	}
+
+	return handler
+}
+
+// setupGracefulShutdown configures proper server shutdown
+func (s *Server) setupGracefulShutdown() {
+	// Channel to listen for interrupt signals
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Wait for interrupt signal
+	go func() {
+		<-stop
+
+		log.Info().Msg("Server is shutting down...")
+
+		// Save counter state before shutting down
+		if s.counter.dirty.Load() {
+			log.Info().Msg("Persisting counter before shutdown")
+			if err := saveCounter(s.counter, s.config); err != nil {
+				log.Error().Err(err).Msg("Error saving counter during shutdown")
+			}
+		}
+
+		// Create a deadline for graceful shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), s.config.ShutdownTimeout)
+		defer cancel()
+
+		if err := s.srv.Shutdown(ctx); err != nil {
+			log.Error().Err(err).Msg("Server forced to shutdown")
+		}
+
+		log.Info().Msg("Server shutdown complete")
+	}()
+}
+
+// Start begins listening for HTTP requests
+func (s *Server) Start() error {
+	// Create HTTP server
+	s.srv = &http.Server{
+		Addr:         ":" + s.config.Port,
+		Handler:      s.setupRoutes(),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	// Set up graceful shutdown
+	s.setupGracefulShutdown()
+
+	// Start the server
+	log.Info().Str("port", s.config.Port).Msg("Counter server started")
+	if err := s.srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("server failed to start: %w", err)
+	}
+
+	return nil
+}
+
+func main() {
+	// Load configuration
+	config := loadConfig()
+
+	// Set up logging
+	setupLogging(config)
+
+	// Create and start server
+	server, err := NewServer(config)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to create server")
+	}
+
+	if err := server.Start(); err != nil {
+		log.Fatal().Err(err).Msg("Server error")
+	}
+}

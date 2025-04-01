@@ -1,0 +1,272 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+// Configuration constants
+const (
+	defaultPort       = "8090"
+	defaultFilename   = "counter.json"
+	shutdownTimeout   = 10 * time.Second
+	filePermissions   = 0644
+	saveRetryAttempts = 3
+	saveRetryDelay    = 100 * time.Millisecond
+)
+
+// VisitCounter stores the visit count using atomic operations for thread safety
+type VisitCounter struct {
+	Visits atomic.Int64
+}
+
+// counterData is used for JSON serialization
+type counterData struct {
+	Visits int64 `json:"visits"`
+}
+
+// HTTPResponse standardizes API responses
+type HTTPResponse struct {
+	Success bool        `json:"success"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+var (
+	filename = getEnv("COUNTER_FILE", defaultFilename)
+	counter  *VisitCounter
+)
+
+// getEnv retrieves an environment variable or returns a default value
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
+}
+
+func init() {
+	var err error
+	counter, err = loadCounter()
+	if err != nil {
+		log.Printf("Error loading counter: %v, starting with zero", err)
+		counter = &VisitCounter{} // fallback to zero
+	}
+	log.Printf("Counter initialized with %d visits", counter.Visits.Load())
+}
+
+// saveCounter persists the counter to disk with file locking
+func saveCounter(counter *VisitCounter) error {
+	data := counterData{Visits: counter.Visits.Load()}
+	jsonBytes, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal counter data: %w", err)
+	}
+
+	// Implement retry logic for file operations
+	var saveErr error
+	for attempt := 0; attempt < saveRetryAttempts; attempt++ {
+		saveErr = writeToDisk(jsonBytes)
+		if saveErr == nil {
+			return nil
+		}
+
+		log.Printf("Save attempt %d failed: %v, retrying...", attempt+1, saveErr)
+		time.Sleep(saveRetryDelay)
+	}
+
+	return fmt.Errorf("failed to save counter after %d attempts: %w", saveRetryAttempts, saveErr)
+}
+
+// writeToDisk handles the actual file writing with proper locking
+func writeToDisk(data []byte) error {
+	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePermissions)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer f.Close()
+
+	// Apply exclusive lock for writing
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("failed to acquire write lock: %w", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+
+	if _, err = f.Write(data); err != nil {
+		return fmt.Errorf("failed to write data: %w", err)
+	}
+
+	// Ensure data is written to disk
+	if err = f.Sync(); err != nil {
+		return fmt.Errorf("failed to sync file: %w", err)
+	}
+
+	return nil
+}
+
+// loadCounter reads the counter from disk with file locking
+func loadCounter() (*VisitCounter, error) {
+	counter := &VisitCounter{}
+
+	f, err := os.OpenFile(filename, os.O_RDONLY|os.O_CREATE, filePermissions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open counter file: %w", err)
+	}
+	defer f.Close()
+
+	// Apply shared lock for reading
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+		return nil, fmt.Errorf("failed to acquire read lock: %w", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+
+	// Check if file is empty
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	if fi.Size() == 0 {
+		// Empty file, return zero counter
+		return counter, nil
+	}
+
+	var data counterData
+	if err := json.NewDecoder(f).Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to decode counter data: %w", err)
+	}
+
+	counter.Visits.Store(data.Visits)
+	return counter, nil
+}
+
+// updateCounter handles the /api/counter endpoint
+func updateCounter(w http.ResponseWriter, req *http.Request) {
+	// Check for proper HTTP method
+	if req.Method != http.MethodPost && req.Method != http.MethodGet {
+		sendJSONResponse(w, http.StatusMethodNotAllowed, HTTPResponse{
+			Success: false,
+			Error:   "Method not allowed",
+		})
+		return
+	}
+
+	// Increment the counter
+	newCount := counter.Visits.Add(1)
+
+	// Save in a goroutine to avoid blocking the response
+	// For critical applications, you might want to wait for the save to complete
+	go func() {
+		if err := saveCounter(counter); err != nil {
+			log.Printf("Error saving counter: %v", err)
+		}
+	}()
+
+	// Send response
+	sendJSONResponse(w, http.StatusOK, HTTPResponse{
+		Success: true,
+		Data: counterData{
+			Visits: newCount,
+		},
+	})
+}
+
+// getCounter handles retrieving the current count without incrementing
+func getCounter(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		sendJSONResponse(w, http.StatusMethodNotAllowed, HTTPResponse{
+			Success: false,
+			Error:   "Method not allowed",
+		})
+		return
+	}
+
+	sendJSONResponse(w, http.StatusOK, HTTPResponse{
+		Success: true,
+		Data: counterData{
+			Visits: counter.Visits.Load(),
+		},
+	})
+}
+
+// sendJSONResponse standardizes the API response format
+func sendJSONResponse(w http.ResponseWriter, statusCode int, response HTTPResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Failed to encode response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+}
+
+// setupRoutes configures the HTTP routes
+func setupRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/counter/increment", updateCounter)
+	mux.HandleFunc("/api/counter", getCounter)
+}
+
+// setupGracefulShutdown configures proper server shutdown
+func setupGracefulShutdown(srv *http.Server) {
+	// Channel to listen for interrupt signals
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Wait for interrupt signal
+	go func() {
+		<-stop
+
+		log.Println("Server is shutting down...")
+
+		// Save counter state before shutting down
+		if err := saveCounter(counter); err != nil {
+			log.Printf("Error saving counter during shutdown: %v", err)
+		}
+
+		// Create a deadline for graceful shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("Server forced to shutdown: %v", err)
+		}
+
+		log.Println("Server shutdown complete")
+	}()
+}
+
+func main() {
+	// Get port from environment or use default
+	port := getEnv("PORT", defaultPort)
+
+	// Create a custom server mux
+	mux := http.NewServeMux()
+	setupRoutes(mux)
+
+	// Configure the HTTP server
+	server := &http.Server{
+		Addr:           ":" + port,
+		Handler:        mux,
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1 MB
+	}
+
+	// Set up graceful shutdown
+	setupGracefulShutdown(server)
+
+	// Start the server
+	log.Printf("Starting Counter Server on port %s...", port)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("Server failed to start: %v", err)
+	}
+}
