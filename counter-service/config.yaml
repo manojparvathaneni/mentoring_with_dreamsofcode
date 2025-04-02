@@ -1,0 +1,34 @@
+# Counter Service Configuration
+
+# Server settings
+port: "8090"
+readTimeout: 5s
+writeTimeout: 10s
+idleTimeout: 120s
+shutdownTimeout: 10s
+
+# File persistence settings
+filename: "data/counter.json"
+filePermissions: 644  # octal file permissions (translated to 0644)
+saveRetryAttempts: 3
+saveRetryDelay: 100ms
+persistInterval: 5m  # Background persistence interval
+
+# Rate limiting
+rateLimit: 10  # Requests per second
+rateBurst: 20  # Burst capacity
+
+# Feature flags
+enableMetrics: true
+enableCORS: true
+
+# CORS settings
+allowedOrigins:
+  - "*"  # Allow all origins
+  # Uncomment and modify for production
+  # - "https://yourdomain.com"
+  # - "https://app.yourdomain.com"
+
+# Logging
+logLevel: "info"  # debug, info, warn, error
+environment: "development"  # development, production, test
