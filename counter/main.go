@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 type VisitCounter struct {
@@ -55,6 +59,35 @@ func saveCounter(counter *VisitCounter) error {
 	return err
 }
 
+// setupGracefulShutdown configures proper server shutdown
+func setupGracefulShutdown(srv *http.Server) {
+	// Channel to listen for interrupt signals
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Wait for interrupt signal
+	go func() {
+		<-stop
+
+		log.Println("Server is shutting down...")
+
+		// Save counter state before shutting down
+		if err := saveCounter(counter); err != nil {
+			log.Printf("Error saving counter during shutdown: %v", err)
+		}
+
+		// Create a deadline for graceful shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("Server forced to shutdown: %v", err)
+		}
+
+		log.Println("Server shutdown complete")
+	}()
+}
+
 func loadCounter() (*VisitCounter, error) {
 	counter := &VisitCounter{}
 
@@ -96,9 +129,26 @@ func updateCounter(w http.ResponseWriter, req *http.Request) {
 }
 
 func main() {
-	http.HandleFunc("/api/counter", updateCounter)
 
-	log.Println("Starting Counter Server....")
-	log.Println("Listening on port 8090")
-	log.Fatal(http.ListenAndServe(":8090", nil))
+	// Create a custom server mux
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/counter", updateCounter)
+
+	// Configure the HTTP server
+	server := &http.Server{
+		Addr:           ":8090",
+		Handler:        mux,
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1 MB
+	}
+
+	// Set up graceful shutdown
+	setupGracefulShutdown(server)
+
+	// Start the server
+	log.Printf("Starting Counter Server on port %s...", "8090")
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("Server failed to start: %v", err)
+	}
 }
